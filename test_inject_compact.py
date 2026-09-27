@@ -307,6 +307,192 @@ def test_setup_error_is_logged():
         os.unlink(log)
 
 
+# ---------------------------------------------------------------- T3 Code transport
+
+def _t3_thread(status="ready", active=None, messages=None, activities=None):
+    if messages is None:
+        messages = [{"id": "u1", "role": "user", "streaming": False, "updatedAt": "t1"},
+                    {"id": "a1", "role": "assistant", "streaming": False, "updatedAt": "t2"}]
+    return {"id": "th", "runtimeMode": "full-access", "interactionMode": "default",
+            "modelSelection": {"instanceId": "claudeAgent", "model": "m"},
+            "session": {"status": status, "activeTurnId": active, "updatedAt": "s1"},
+            "messages": messages, "activities": activities or []}
+
+
+def test_t3_idle_after_finished_reply():
+    assert ic.t3_not_idle(_t3_thread()) is None
+
+
+def test_t3_not_idle_while_running_or_stopped():
+    assert ic.t3_not_idle(_t3_thread(status="running", active="turn")) == "session running"
+    assert ic.t3_not_idle(_t3_thread(status="ready", active="turn")) == "turn active"
+    for status in ("starting", "interrupted", "stopped", "error"):
+        assert ic.t3_not_idle(_t3_thread(status=status)) is not None
+
+
+def test_t3_not_idle_when_someone_else_sent_a_message():
+    msgs = [{"id": "a1", "role": "assistant", "streaming": False},
+            {"id": "u2", "role": "user", "streaming": False}]
+    assert ic.t3_not_idle(_t3_thread(messages=msgs)) is not None
+    # ...unless that newest message is our own /compact, which gets no reply.
+    assert ic.t3_not_idle(_t3_thread(messages=msgs), own_message="u2") is None
+
+
+def test_t3_not_idle_while_streaming_or_empty():
+    streaming = [{"id": "a1", "role": "assistant", "streaming": True}]
+    assert ic.t3_not_idle(_t3_thread(messages=streaming)) is not None
+    assert ic.t3_not_idle(_t3_thread(messages=[])) == "no messages"
+    assert ic.t3_not_idle({"messages": []}) == "no provider session"
+
+
+def test_t3_turn_start_mirrors_thread():
+    cmd = ic.t3_turn_start(_t3_thread(), "/compact")
+    assert cmd["type"] == "thread.turn.start" and cmd["threadId"] == "th"
+    assert cmd["message"]["text"] == "/compact" and cmd["message"]["role"] == "user"
+    assert cmd["message"]["attachments"] == []
+    assert (cmd["runtimeMode"], cmd["interactionMode"]) == ("full-access", "default")
+    assert cmd["modelSelection"]["instanceId"] == "claudeAgent"
+    assert cmd["createdAt"].endswith("Z")
+    assert cmd["commandId"] != cmd["message"]["messageId"]
+
+
+def test_t3_compaction_outcome_matches_request_id():
+    ok = {"kind": "context-compaction", "summary": "Compacted context 900k to 40k tokens",
+          "payload": {"state": "compacted", "requestId": "m1"}}
+    other = {"kind": "context-compaction", "summary": "auto", "payload": {"requestId": "m0"}}
+    failed = {"kind": "provider.turn.start.failed", "summary": "Context compaction failed",
+              "payload": {"detail": "unavailable while a provider turn is running", "requestId": "m1"}}
+    assert ic.t3_compaction_outcome(_t3_thread(activities=[other]), "m1") is None
+    assert ic.t3_compaction_outcome(_t3_thread(activities=[other, ok]), "m1")[0] == "ok"
+    assert ic.t3_compaction_outcome(_t3_thread(activities=[failed]), "m1") == \
+        ("failed", "unavailable while a provider turn is running")
+    assert ic.t3_compaction_outcome(_t3_thread(activities=["junk", {"payload": None}]), "m1") is None
+
+
+def test_t3_wait_idle_requires_two_equal_samples():
+    samples = [_t3_thread(status="running", active="t"), _t3_thread(), _t3_thread()]
+
+    class Api:
+        calls = 0
+
+        def thread(self, _):
+            Api.calls += 1
+            return samples[min(Api.calls, len(samples)) - 1]
+
+    real_poll, ic.T3_POLL = ic.T3_POLL, 0
+    try:
+        thread, why = ic.t3_wait_idle(Api(), "th", timeout=5)
+    finally:
+        ic.T3_POLL = real_poll
+    assert why is None and thread["session"]["status"] == "ready" and Api.calls == 3
+
+
+def test_t3_wait_idle_times_out():
+    class Api:
+        def thread(self, _):
+            raise ic.T3Error("connection refused")
+
+    real_poll, ic.T3_POLL = ic.T3_POLL, 0.01
+    try:
+        thread, why = ic.t3_wait_idle(Api(), "th", timeout=0.05)
+    finally:
+        ic.T3_POLL = real_poll
+    assert thread is None and "connection refused" in why
+
+
+def test_t3_thread_for_session():
+    import sqlite3
+    d = tempfile.mkdtemp()
+    os.mkdir(os.path.join(d, "userdata"))
+    con = sqlite3.connect(os.path.join(d, "userdata", "state.sqlite"))
+    con.execute("create table provider_session_runtime (thread_id text, resume_cursor_json text)")
+    con.execute("insert into provider_session_runtime values ('th-1', ?)", (json.dumps({"resume": "sess-a"}),))
+    con.execute("insert into provider_session_runtime values ('th-2', ?)", (json.dumps({"resume": "sess-b"}),))
+    con.commit()
+    con.close()
+    assert ic.t3_thread_for_session(d, "sess-b") == "th-2"
+    try:
+        ic.t3_thread_for_session(d, "sess-missing")
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("resolved a session with no thread")
+
+
+def test_t3_base_dir_from_cmdline():
+    import subprocess
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)", "serve", "--base-dir", "/srv/t3"])
+    try:
+        for _ in range(50):
+            with open(f"/proc/{p.pid}/cmdline", "rb") as f:
+                if b"--base-dir" in f.read():
+                    break
+            import time
+            time.sleep(0.02)
+        assert ic.t3_base_dir(p.pid) == "/srv/t3"
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_t3_api_sends_bearer_and_ignores_proxy_env():
+    import http.server
+    import threading
+    seen = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen["auth"] = self.headers.get("Authorization")
+            seen["body"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            out = b'{"sequence": 7}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.handle_request, daemon=True).start()
+    old = os.environ.get("http_proxy")
+    os.environ["http_proxy"] = "http://127.0.0.1:9"  # would swallow the token if honoured
+    try:
+        api = ic.T3Api(f"http://127.0.0.1:{server.server_port}", "tok")
+        assert api.dispatch({"type": "x"}) == {"sequence": 7}
+    finally:
+        if old is None:
+            del os.environ["http_proxy"]
+        else:
+            os.environ["http_proxy"] = old
+        server.server_close()
+    assert seen == {"auth": "Bearer tok", "body": {"type": "x"}}
+
+
+def test_t3_refuses_commands_it_does_not_handle():
+    server = ic.T3Server(1, "/nonexistent", "http://127.0.0.1:1", "/bin/false")
+    a = ic.parse_args(["--pid", "12", "--session", "abc", "--command", "/logout"])
+    for command in ("/logout", "/clear", "/compact keep the tests"):
+        a.command = command
+        try:
+            ic.run_t3(a, lambda _: None, server)
+        except SystemExit as e:
+            assert "only" in str(e.code)
+        else:
+            raise AssertionError(f"accepted {command!r}")
+
+
+def test_t3_refuses_non_loopback_origin():
+    server = ic.T3Server(1, "/nonexistent", "http://100.64.0.9:3774", "/bin/false")
+    a = ic.parse_args(["--pid", "12", "--session", "abc"])
+    try:
+        ic.run_t3(a, lambda _: None, server)
+    except SystemExit as e:
+        assert "not loopback" in str(e.code)
+    else:
+        raise AssertionError("sent a token to a non-loopback origin")
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failures = 0

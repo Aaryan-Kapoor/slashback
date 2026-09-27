@@ -18,15 +18,23 @@ Exit status: 0 delivered, 2 gave up (no idle window, or a pre-write check failed
 import argparse
 import array
 import ctypes
+import datetime
 import errno
 import fcntl
 import json
+import math
 import os
 import pwd
 import re
 import select
+import sqlite3
+import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 
 SYS_pidfd_open = 434
 SYS_pidfd_getfd = 438
@@ -368,6 +376,309 @@ def compaction_observed(path, previous_size):
     return False
 
 
+# ---------------------------------------------------------------- T3 Code transport
+#
+# Under T3 Code, claude is an SDK child of the T3 server and speaks stream-json over
+# sockets, so there is no pty to type into. T3 exposes the operation its own UI uses
+# to send a message, POST /api/orchestration/dispatch, and it handles a message that
+# is exactly "/compact" as a compaction request of its own: it refuses while a turn is
+# running and reports the outcome as a thread activity tagged with the message id.
+# The injector authenticates the way `t3 project add` does, with a short-lived bearer
+# session minted by the T3 CLI and revoked on exit. No root is involved.
+
+T3_COMMANDS = {"/compact"}          # the only slash command T3 handles natively
+T3_IDLE_STATUS = {"ready", "idle"}
+T3_POLL = 1.0
+T3_COMPACTION_TIMEOUT = 660.0       # T3 itself gives up on the provider after 10 minutes
+T3_SETTLE_TIMEOUT = 300.0           # for the session to go idle again afterwards
+T3_RESUME_OK = "[self-compact] Context compacted. Continue where you left off."
+T3_RESUME_FAILED = "[self-compact] Compaction did not complete ({}). Continue where you left off."
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+
+
+class T3Error(Exception):
+    pass
+
+
+class T3Server:
+    def __init__(self, pid, base_dir, origin, exe):
+        self.pid, self.base_dir, self.origin, self.exe = pid, base_dir, origin, exe
+
+
+def t3_base_dir(pid):
+    """The data directory a T3 server process was started with (--base-dir, T3CODE_HOME, ~/.t3)."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            args = [x.decode(errors="replace") for x in f.read().split(b"\0")]
+    except OSError:
+        return None
+    for i, arg in enumerate(args):
+        if arg == "--base-dir" and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith("--base-dir="):
+            return arg.split("=", 1)[1]
+    env = process_environ(pid)
+    if env.get("T3CODE_HOME"):
+        return env["T3CODE_HOME"]
+    try:
+        return os.path.join(pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid).pw_dir, ".t3")
+    except (OSError, KeyError):
+        return None
+
+
+def find_t3_server(claude_pid):
+    """The T3 Code server that spawned this claude, or None if it was not launched by T3.
+
+    An ancestor counts only if its data directory's server-runtime.json names it by pid,
+    so an unrelated process can never be mistaken for the server.
+    """
+    for pid in ancestors(claude_pid)[1:]:
+        base = t3_base_dir(pid)
+        if not base:
+            continue
+        try:
+            with open(os.path.join(base, "userdata", "server-runtime.json")) as f:
+                runtime = json.load(f)
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except (OSError, ValueError):
+            continue
+        if isinstance(runtime, dict) and runtime.get("pid") == pid and isinstance(runtime.get("origin"), str):
+            return T3Server(pid, base, runtime["origin"], exe)
+    return None
+
+
+def t3_thread_for_session(base_dir, session_id):
+    """The T3 thread whose Claude provider session is session_id (read-only lookup)."""
+    db = os.path.join(base_dir, "userdata", "state.sqlite")
+    try:
+        con = sqlite3.connect(f"file:{urllib.parse.quote(db)}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = con.execute(
+                "select thread_id from provider_session_runtime"
+                " where json_extract(resume_cursor_json, '$.resume') = ?", (session_id,)).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        raise SystemExit(f"cannot read the T3 thread index {db}: {e}")
+    if len(rows) != 1:
+        raise SystemExit(f"expected one T3 thread for session {session_id}, found {len(rows)}")
+    return rows[0][0]
+
+
+def t3_issue_token(server, ttl_seconds, label):
+    """Mint a bearer session with the T3 CLI. Returns (auth session id, token)."""
+    minutes = max(1, math.ceil(ttl_seconds / 60))
+    try:
+        r = subprocess.run([server.exe, "auth", "session", "issue", "--base-dir", server.base_dir,
+                            "--ttl", f"{minutes}m", "--label", label, "--json"],
+                           capture_output=True, text=True, timeout=60)
+        issued = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        raise SystemExit(f"t3 auth session issue failed: {e}")
+    if not isinstance(issued, dict) or not issued.get("token") or not issued.get("sessionId"):
+        raise SystemExit(f"t3 auth session issue failed: {r.stderr.strip()[:200]}")
+    return issued["sessionId"], issued["token"]
+
+
+def t3_revoke_token(server, auth_session_id):
+    try:
+        r = subprocess.run([server.exe, "auth", "session", "revoke", "--base-dir", server.base_dir,
+                            auth_session_id], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+class T3Api:
+    def __init__(self, origin, token):
+        self.origin = origin.rstrip("/")
+        self.token = token
+        # Never route the bearer token through an http_proxy from the environment.
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def _request(self, method, path, body=None):
+        req = urllib.request.Request(
+            self.origin + path, method=method,
+            data=None if body is None else json.dumps(body).encode(),
+            headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
+        try:
+            with self.opener.open(req, timeout=30) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as e:
+            raise T3Error(f"{method} {path}: HTTP {e.code} {e.read()[:300].decode(errors='replace')}")
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise T3Error(f"{method} {path}: {e}")
+
+    def thread(self, thread_id):
+        snap = self._request("GET", f"/api/orchestration/threads/{urllib.parse.quote(thread_id)}")
+        if not isinstance(snap, dict) or not isinstance(snap.get("thread"), dict):
+            raise T3Error("thread snapshot has no thread")
+        return snap["thread"]
+
+    def dispatch(self, command):
+        return self._request("POST", "/api/orchestration/dispatch", command)
+
+
+def t3_not_idle(thread, own_message=None):
+    """Why the T3 thread is not at an idle prompt, or None if it is.
+
+    Idle means the provider session is ready with no active turn and the newest message
+    is a finished assistant reply (or own_message, our /compact, which gets no reply).
+    A newer user message means someone else has a turn pending, which is not idle.
+    """
+    session = thread.get("session")
+    if not isinstance(session, dict):
+        return "no provider session"
+    if session.get("status") not in T3_IDLE_STATUS:
+        return f"session {session.get('status')}"
+    if session.get("activeTurnId") is not None:
+        return "turn active"
+    messages = thread.get("messages") or []
+    if not messages or not isinstance(messages[-1], dict):
+        return "no messages"
+    last = messages[-1]
+    if own_message is not None and last.get("id") == own_message:
+        return None
+    if last.get("role") != "assistant" or last.get("streaming"):
+        return "newest message is not a finished assistant reply"
+    return None
+
+
+def t3_idle_key(thread):
+    """Identity of an idle observation; two equal keys a poll apart mean a stable idle."""
+    session, last = thread["session"], thread["messages"][-1]
+    return (session.get("status"), session.get("updatedAt"), last.get("id"), last.get("updatedAt"))
+
+
+def t3_turn_start(thread, text):
+    """A thread.turn.start command shaped like the one T3's composer sends."""
+    command = {
+        "type": "thread.turn.start",
+        "commandId": str(uuid.uuid4()),
+        "threadId": thread["id"],
+        "message": {"messageId": str(uuid.uuid4()), "role": "user", "text": text, "attachments": []},
+        "runtimeMode": thread["runtimeMode"],
+        "interactionMode": thread["interactionMode"],
+        "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+    }
+    if thread.get("modelSelection"):
+        command["modelSelection"] = thread["modelSelection"]
+    return command
+
+
+def t3_compaction_outcome(thread, message_id):
+    """("ok", summary) or ("failed", detail) once T3 reports on our /compact, else None."""
+    for activity in thread.get("activities") or []:
+        payload = activity.get("payload") if isinstance(activity, dict) else None
+        if not isinstance(payload, dict) or payload.get("requestId") != message_id:
+            continue
+        if activity.get("kind") == "context-compaction":
+            return "ok", activity.get("summary") or "compacted"
+        if activity.get("kind") == "provider.turn.start.failed":
+            return "failed", str(payload.get("detail") or activity.get("summary") or "unknown")
+    return None
+
+
+def t3_wait_idle(api, thread_id, timeout, own_message=None):
+    """Poll until the thread is idle on two consecutive samples. Returns (thread, None) or (None, why)."""
+    deadline = time.monotonic() + timeout
+    previous, why = None, "not sampled"
+    while True:
+        try:
+            thread = api.thread(thread_id)
+            why = t3_not_idle(thread, own_message)
+        except T3Error as e:
+            thread, why = None, f"T3 API: {e}"
+        if why is None:
+            key = t3_idle_key(thread)
+            if key == previous:
+                return thread, None
+            previous = key
+        else:
+            previous = None
+        if time.monotonic() >= deadline:
+            return None, why
+        time.sleep(T3_POLL)
+
+
+def run_t3(a, log, server):
+    drop_privileges()  # nothing here needs root; keep T3's files user-owned
+    if a.command not in T3_COMMANDS:
+        raise SystemExit(f"under T3 Code only {sorted(T3_COMMANDS)} is supported, refusing {a.command!r}")
+    if urllib.parse.urlsplit(server.origin).hostname not in LOOPBACK:
+        raise SystemExit(f"T3 server origin {server.origin} is not loopback; refusing to send it a bearer token")
+    thread_id = t3_thread_for_session(server.base_dir, a.session)
+    transcript = a.transcript or find_transcript(a.pid, a.session)
+    if not os.path.isfile(transcript):
+        log(f"gave up: transcript not found at {transcript}")
+        return 2
+    if acquire_lock(transcript, a.session) is None:
+        log("gave up: another injector is already armed for this session")
+        return 2
+    log(f"armed: transport=t3 claude={a.pid} thread={thread_id} session={a.session} "
+        f"command={a.command!r} resume={a.resume} uid={os.getuid()}")
+
+    ttl = a.timeout + T3_COMPACTION_TIMEOUT + T3_SETTLE_TIMEOUT + 120
+    auth_session, token = t3_issue_token(server, ttl, f"self-compact {a.session[:8]}")
+    try:
+        return t3_deliver(a, log, T3Api(server.origin, token), thread_id)
+    finally:
+        if t3_revoke_token(server, auth_session):
+            log(f"revoked T3 auth session {auth_session}")
+        else:
+            log(f"could not revoke T3 auth session {auth_session}; it expires in {math.ceil(ttl / 60)}m")
+
+
+def t3_deliver(a, log, api, thread_id):
+    time.sleep(1)  # let the arming turn settle before sampling
+    thread, why = t3_wait_idle(api, thread_id, a.timeout)
+    if thread is None:
+        log(f"gave up: no idle window within {a.timeout:.0f}s (last reason: {why})")
+        return 2
+    compact = t3_turn_start(thread, a.command)
+    message_id = compact["message"]["messageId"]
+    if a.dry_run:
+        log(f"dry-run: would dispatch {a.command!r} to thread {thread_id}")
+        log(f"delivered {a.command!r} (dry-run, nothing sent)")
+        return 0
+    try:
+        api.dispatch(compact)
+    except T3Error as e:
+        log(f"aborted before command: {e}")
+        return 2
+    log(f"delivered {a.command!r} as T3 message {message_id}")
+
+    outcome, deadline = None, time.monotonic() + T3_COMPACTION_TIMEOUT
+    while outcome is None and time.monotonic() < deadline:
+        time.sleep(2)
+        try:
+            outcome = t3_compaction_outcome(api.thread(thread_id), message_id)
+        except T3Error:
+            pass  # the server can be briefly busy mid-compaction; keep polling
+    if outcome is None:
+        outcome = ("failed", f"no outcome reported within {T3_COMPACTION_TIMEOUT:.0f}s")
+    compacted = outcome[0] == "ok"
+    log(f"compaction observed in T3: {outcome[1]}" if compacted else f"compaction failed in T3: {outcome[1]}")
+    if not a.resume:
+        return 0 if compacted else 2
+
+    # Compaction ends the model's turn and nothing else will start the next one, so
+    # send a fixed follow-up once the session is idle again, whatever the outcome.
+    thread, why = t3_wait_idle(api, thread_id, T3_SETTLE_TIMEOUT, own_message=message_id)
+    if thread is None:
+        log(f"resume not sent: session did not go idle within {T3_SETTLE_TIMEOUT:.0f}s (last reason: {why})")
+        return 2
+    reason = re.sub(r"[^\x20-\x7e]", " ", outcome[1])[:200]
+    text = T3_RESUME_OK if compacted else T3_RESUME_FAILED.format(reason)
+    try:
+        api.dispatch(t3_turn_start(thread, text))
+    except T3Error as e:
+        log(f"resume not sent: {e}")
+        return 2
+    log("resume sent")
+    return 0 if compacted else 2
+
+
 # ---------------------------------------------------------------- main
 
 def validate_command(command):
@@ -397,7 +708,12 @@ def parse_args(argv):
     ap.add_argument("--transcript", default=None, help="override the derived transcript path")
     ap.add_argument("--timeout", type=float, default=90.0, help="seconds to wait for an idle prompt")
     ap.add_argument("--dry-run", action="store_true", help="do everything except write keystrokes")
+    ap.add_argument("--transport", choices=("auto", "pty", "t3"), default="auto",
+                    help="t3 when launched by T3 Code, else the ssh pty master (default auto)")
+    ap.add_argument("--no-resume", dest="resume", action="store_false",
+                    help="t3 only: do not send the follow-up that restarts work after compaction")
     a = ap.parse_args(argv)
+    a.argv = list(argv)
     if a.pid <= 0:
         ap.error("--pid must be a positive integer")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", a.session):
@@ -420,11 +736,25 @@ def main(argv=None):
         return 1
 
 
+def elevate(argv):
+    """Re-exec under passwordless sudo: the pty transport needs PTRACE_MODE_ATTACH on sshd."""
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
+        raise SystemExit("the pty transport needs passwordless sudo (sudo -n failed)")
+    os.execvp("sudo", ["sudo", "-n", sys.executable, os.path.abspath(__file__), *argv])
+
+
 def run(a, log):
     command = validate_command(a.command)
+    validate_target(a.pid)
+    server = find_t3_server(a.pid) if a.transport != "pty" else None
+    if server is not None:
+        return run_t3(a, log, server)
+    if a.transport == "t3":
+        raise SystemExit("claude was not launched by a T3 Code server")
+    if os.geteuid() != 0:
+        elevate(a.argv)
 
     # Privileged phase: identify the target and hold its pty master, nothing else.
-    validate_target(a.pid)
     ptsnum = pts_of(a.pid)
     master = steal_master(a.pid, ptsnum)
     claude_fd = pidfd_of(a.pid)
