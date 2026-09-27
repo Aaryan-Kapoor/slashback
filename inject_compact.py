@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Self-compact injector for a live Claude Code session.
 
-Types a slash command (default /compact) at the session's own idle prompt by
+Types an allowlisted slash command (default /compact) at the session's own idle prompt by
 duplicating the ssh pty master fd out of sshd with pidfd_getfd and writing the
 keystrokes to it. Must run detached and under sudo: pidfd_getfd needs
 PTRACE_MODE_ATTACH on the sshd process. Root is dropped back to the invoking
@@ -59,7 +59,46 @@ METADATA_TYPES = {
     "summary",
 }
 
-COMMAND_RE = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9 _:./=\-]{0,199}$")
+# Slash commands the pty transport will type, each mapped to the pattern its argument
+# must fully match (the empty string when it takes none). Everything else is refused:
+# commands that loosen permissions, touch accounts or billing, send data off the
+# machine, discard or fork the session, or run skills. Aliases are not accepted.
+# Free text leaves out "@", which opens the file picker and would swallow the Enter,
+# and "\", which turns the Enter into a newline.
+TEXT = r"[A-Za-z0-9 .,:;!?'\"()#%&*+=_/-]"
+NO_ARG = r""
+ALLOWED_COMMANDS = {
+    # context and self-maintenance
+    "/compact": rf"(?:{TEXT}{{1,300}})?",
+    "/recap": NO_ARG,
+    "/context": NO_ARG,
+    "/reload-skills": NO_ARG,
+    "/pause-memory": NO_ARG,
+    "/rename": rf"{TEXT}{{1,80}}",
+    "/btw": rf"{TEXT}{{1,300}}",
+    "/list-agents": NO_ARG,
+    # read-only information
+    "/usage": NO_ARG,
+    "/status": NO_ARG,
+    "/version": NO_ARG,
+    "/help": NO_ARG,
+    "/skills": NO_ARG,
+    "/skill-doctor": NO_ARG,
+    "/doctor": NO_ARG,
+    "/release-notes": NO_ARG,
+    "/diff": NO_ARG,
+    # display and mode
+    "/plan": NO_ARG,
+    "/brief": NO_ARG,
+    "/focus": NO_ARG,
+    "/theme": r"(?:[a-z0-9-]{1,40})?",
+    "/color": r"(?:[a-z0-9-]{1,40})?",
+    "/tui": r"(?:default|fullscreen)?",
+    "/scroll-speed": r"(?:[0-9]{1,2}(?:\.[0-9])?)?",
+    # model and effort, both undone by one more command
+    "/model": r"(?:default|fable|opus|sonnet|haiku|opusplan|claude-[a-z0-9-]{1,60})(?:\[1m\])?",
+    "/effort": r"low|medium|high|xhigh|max",
+}
 QUIET_SECONDS = 1.0        # transcript must be untouched this long after a finished turn
 WRITE_TIMEOUT = 2.0        # per keystroke write, on a possibly non-blocking master
 TAIL_WINDOW = 65536        # initial tail read; doubled up to TAIL_MAX for large records
@@ -682,8 +721,12 @@ def t3_deliver(a, log, api, thread_id):
 # ---------------------------------------------------------------- main
 
 def validate_command(command):
-    if not COMMAND_RE.fullmatch(command):
-        raise SystemExit(f"refusing command {command!r}: must be a single-line slash command")
+    name, _, arg = command.partition(" ")
+    pattern = ALLOWED_COMMANDS.get(name)
+    if pattern is None:
+        raise SystemExit(f"refusing command {name!r}: not on the allowlist")
+    if command != " ".join(command.split()) or not re.fullmatch(pattern, arg):
+        raise SystemExit(f"refusing command {command!r}: argument not accepted by {name}")
     return command
 
 
@@ -703,7 +746,8 @@ def parse_args(argv):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pid", type=int, required=True, help="pid of the claude TUI process ($CLAUDE_PID)")
     ap.add_argument("--session", required=True, help="session id ($CLAUDE_CODE_SESSION_ID)")
-    ap.add_argument("--command", default="/compact", help="slash command to type (default /compact)")
+    ap.add_argument("--command", default="/compact",
+                    help="allowlisted slash command to send (default /compact; T3 accepts only /compact)")
     ap.add_argument("--log", default=None, help="append progress and outcome to this file")
     ap.add_argument("--transcript", default=None, help="override the derived transcript path")
     ap.add_argument("--timeout", type=float, default=90.0, help="seconds to wait for an idle prompt")

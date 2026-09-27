@@ -183,14 +183,29 @@ def test_compaction_observed():
 # ---------------------------------------------------------------- guards
 
 def test_command_validation():
-    assert ic.validate_command("/compact") == "/compact"
-    assert ic.validate_command("/compact focus on the parser") == "/compact focus on the parser"
-    for bad in ("compact", "/compact\rls", "/a\nb", "/x\x1b[A", "", "/" + "a" * 300):
+    good = ("/compact", "/compact focus on the parser, keep the test names", "/recap", "/context",
+            "/reload-skills", "/rename parser rewrite", "/btw is the lock per session?", "/usage",
+            "/status", "/plan", "/theme dark", "/theme", "/tui fullscreen", "/model fable",
+            "/model claude-opus-5-5[1m]", "/effort xhigh", "/scroll-speed 2.5")
+    for command in good:
+        assert ic.validate_command(command) == command, command
+    bad = (
+        "compact", "", "/compact\rls", "/a\nb", "/x\x1b[A", "/compact " + "a" * 301,
+        # not on the allowlist, including aliases of allowed commands
+        "/logout", "/login", "/permissions", "/hooks", "/config", "/add-dir /", "/mcp",
+        "/plugin", "/clear", "/reset", "/rewind", "/exit", "/resume", "/fork", "/goal done",
+        "/teleport", "/feedback hi", "/export", "/heapdump", "/fast", "/batch", "/cost",
+        # arguments the command does not take, or text that would not submit as typed
+        "/context full", "/rename", "/btw", "/model gpt-5", "/model", "/effort turbo",
+        "/tui classic", "/compact see @secrets.txt", "/compact line\\", "/compact  two  spaces",
+        "/compact ", " /compact", "/compact\ttab",
+    )
+    for command in bad:
         try:
-            ic.validate_command(bad)
+            ic.validate_command(command)
         except SystemExit:
             continue
-        raise AssertionError(f"accepted {bad!r}")
+        raise AssertionError(f"accepted {command!r}")
 
 
 def test_parse_stat_with_parens_in_comm():

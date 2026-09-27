@@ -29,7 +29,7 @@ disown
 
 Do not wrap it in `sudo` yourself. The SSH path elevates on its own, and the T3 path must not run as root.
 
-The T3 path only accepts the exact message `/compact`, because that is the only slash command T3 handles natively. Anything else, including `/compact` with instructions, is refused. On the SSH path `--command /model` sends a different single-line slash command. `--no-resume` skips the T3 follow-up message, `--timeout` changes the 90 second wait for an idle prompt, `--transport pty|t3` overrides detection, and `--dry-run` does everything except send, which is the way to test the setup.
+The T3 path only accepts the exact message `/compact`, because that is the only slash command T3 handles natively. Anything else, including `/compact` with instructions, is refused. On the SSH path `--command` can send any command on the injector's allowlist, for example `--command "/compact keep the parser notes"` or `--command "/model fable"`. The allowlist covers context upkeep (`/compact`, `/recap`, `/context`, `/reload-skills`, `/pause-memory`, `/rename`, `/btw`, `/list-agents`), read-only information (`/usage`, `/status`, `/version`, `/help`, `/skills`, `/skill-doctor`, `/doctor`, `/release-notes`, `/diff`), display and mode (`/plan`, `/brief`, `/focus`, `/theme`, `/color`, `/tui`, `/scroll-speed`), and `/model` and `/effort` with fixed argument sets. Aliases, free text containing `@` or `\`, and every other command are refused. `--no-resume` skips the T3 follow-up message, `--timeout` changes the 90 second wait for an idle prompt, `--transport pty|t3` overrides detection, and `--dry-run` does everything except send, which is the way to test the setup.
 
 ## Why it must be detached and idle-gated
 
