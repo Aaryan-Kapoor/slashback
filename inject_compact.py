@@ -408,6 +408,19 @@ def parse_args(argv):
 def main(argv=None):
     a = parse_args(sys.argv[1:] if argv is None else argv)
     log = Log(a.log)
+    try:
+        return run(a, log)
+    except SystemExit as e:
+        if not isinstance(e.code, str):
+            raise
+        # The arming wrapper discards stderr, so a setup error that is only printed
+        # leaves no trace. Record it, unprivileged so the log stays user-owned.
+        drop_privileges()
+        log(f"setup error: {e.code}")
+        return 1
+
+
+def run(a, log):
     command = validate_command(a.command)
 
     # Privileged phase: identify the target and hold its pty master, nothing else.

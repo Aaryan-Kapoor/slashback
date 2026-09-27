@@ -293,6 +293,20 @@ def test_args_require_positive_pid_and_session():
     assert (a.pid, a.session, a.command, a.timeout) == (12, "abc-123", "/compact", 90.0)
 
 
+def test_setup_error_is_logged():
+    # The arming wrapper sends stderr to /dev/null, so a setup error must reach --log.
+    fd, log = tempfile.mkstemp(suffix=".log")
+    os.close(fd)
+    try:
+        rc = ic.main(["--pid", str(os.getpid()), "--session", "abc", "--log", log])
+        with open(log) as f:
+            text = f.read()
+        assert rc == 1
+        assert "setup error: pid" in text and "is not a claude process" in text
+    finally:
+        os.unlink(log)
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failures = 0
