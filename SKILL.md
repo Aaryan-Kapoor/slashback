@@ -1,13 +1,13 @@
 ---
-name: self-compact
-description: Make the current Claude Code session run /compact on itself from within a tool call, either in a T3 Code thread or in a bare SSH login with no tmux, and restart work afterwards in T3. Use when you need the live session to compact itself.
+name: slashback
+description: Make the current Claude Code session run /compact (or another allowlisted slash command) on itself from within a tool call, either in a T3 Code thread or in a bare SSH login with no tmux, and restart work afterwards in T3. Use when you need the live session to compact itself.
 ---
 
-# Self-compact
+# slashback
 
 Runs `/compact` against the current Claude Code session exactly as if the user had sent it, without anyone touching the keyboard. The injector picks one of two supported paths on its own.
 
-- **T3 Code.** When the session was launched by a T3 Code server, the injector sends `/compact` as a message through T3's own orchestration API (`POST /api/orchestration/dispatch`), which is the same operation T3's composer performs. T3 recognises that message as a compaction request, refuses it while a turn is running, and reports the result as a thread activity. The injector authenticates with a short-lived bearer session minted by the `t3` CLI, the same way `t3 project add` talks to a running server, and revokes that session when it exits. No root is involved. Once compaction has finished, it sends one fixed follow-up message, `[self-compact] Context compacted. Continue where you left off.`, so that the session starts working again.
+- **T3 Code.** When the session was launched by a T3 Code server, the injector sends `/compact` as a message through T3's own orchestration API (`POST /api/orchestration/dispatch`), which is the same operation T3's composer performs. T3 recognises that message as a compaction request, refuses it while a turn is running, and reports the result as a thread activity. The injector authenticates with a short-lived bearer session minted by the `t3` CLI, the same way `t3 project add` talks to a running server, and revokes that session when it exits. No root is involved. Once compaction has finished, it sends one fixed follow-up message, `[slashback] Context compacted. Continue where you left off.`, so that the session starts working again.
 - **SSH terminal.** When the session is a TUI reached over SSH, the injector duplicates the ssh pty master file descriptor out of `sshd` with `pidfd_getfd` and types the keystrokes into it, so the TUI parses the command as real typed input. For this path the injector re-executes itself under `sudo -n` and drops root again as soon as it holds the descriptor.
 
 ## Requirements
@@ -21,8 +21,8 @@ For an SSH terminal you need an `sshd` process holding the pty master (tmux is n
 Arm the injector detached, passing this session's own pid and session id from the environment Claude Code exports to every tool shell, then end the turn immediately and say nothing further:
 
 ```bash
-LOG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/self-compact.log"
-setsid python3 ~/.claude/skills/self-compact/inject_compact.py \
+LOG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/slashback.log"
+setsid python3 ~/.claude/skills/slashback/slashback.py \
   --pid "$CLAUDE_PID" --session "$CLAUDE_CODE_SESSION_ID" --log "$LOG" >/dev/null 2>&1 &
 disown
 ```

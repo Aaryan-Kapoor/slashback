@@ -1,16 +1,18 @@
-# Self-`/compact`: making a live Claude Code session run a slash command on itself
+<p align="center"><img src="assets/banner.gif" alt="slashback: a live Claude Code session running slash commands on itself" width="100%"></p>
 
-This document explains how a running Claude Code session reached over plain SSH can execute `/compact` (or any other slash command) against itself, exactly as if a human had typed it at the prompt. It was worked out and verified on 2026-09-09 against Claude Code 2.1.263–2.1.267 running under a bare SSH login, with no tmux or screen in between, on Linux 7.0.0-30-generic.
+# slashback
 
-The short version is that the only thing the TUI treats as a real command is a keystroke arriving on its terminal input, so the whole problem reduces to getting characters onto that input from inside a tool call. Every channel that looks like it should carry a command turns out not to, and the one channel that does, the pty master, belongs to `sshd` and is fenced off from the obvious `/proc` route. The unlock is to duplicate the master file descriptor out of `sshd` with `pidfd_getfd`, and the sections below explain both why the easy doors are locked and why this one opens.
+slashback lets a running Claude Code session execute `/compact`, or another allowlisted slash command, against itself, exactly as if a human had typed it at the prompt. It works in a session reached over plain SSH and in a session launched by T3 Code. The SSH path was worked out and verified on 2026-09-09 against Claude Code 2.1.263–2.1.267 running under a bare SSH login, with no tmux or screen in between, on Linux 7.0.0-30-generic, and the T3 path on 2026-09-27.
+
+On the SSH path, the short version is that the only thing the TUI treats as a real command is a keystroke arriving on its terminal input, so the whole problem reduces to getting characters onto that input from inside a tool call. Every channel that looks like it should carry a command turns out not to, and the one channel that does, the pty master, belongs to `sshd` and is fenced off from the obvious `/proc` route. The unlock is to duplicate the master file descriptor out of `sshd` with `pidfd_getfd`, and the sections below explain both why the easy doors are locked and why this one opens.
 
 ## The one-line answer
 
 From inside the session, arm the injector detached, handing it this session's own pid and session id from the environment Claude Code exports to every tool shell, then end the turn immediately and say nothing else:
 
 ```bash
-LOG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/self-compact.log"
-setsid python3 inject_compact.py \
+LOG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/slashback.log"
+setsid python3 slashback.py \
   --pid "$CLAUDE_PID" --session "$CLAUDE_CODE_SESSION_ID" --log "$LOG" >/dev/null 2>&1 &
 disown
 ```
@@ -93,7 +95,7 @@ T3 already offers a supported way in. Its server exposes an authenticated HTTP A
 
 The injector finds the T3 server by walking claude's ancestors and accepting one only when its data directory's `server-runtime.json` names that exact pid. It maps the session id to a T3 thread with a read-only lookup in T3's `provider_session_runtime` table and mints a bearer session with `t3 auth session issue`, whose time-to-live covers the whole run, in the same way `t3 project add` authenticates to a running server. The token is held only in memory, is sent only to a loopback origin with proxies disabled, and is revoked with `t3 auth session revoke` when the injector exits. It then waits until the thread's provider session is `ready` with no active turn and its newest message is a finished assistant reply, stable across two polls. At that point it dispatches `/compact` and watches the snapshot for the outcome activity carrying its message id.
 
-Compaction ends the model's turn and nothing else will start the next one, so on this path the injector finishes with a single fixed follow-up message, `[self-compact] Context compacted. Continue where you left off.`, once the thread has gone idle again. If compaction failed, the follow-up carries the failure reason instead, so the session still resumes and knows what happened. `--no-resume` turns the follow-up off. The follow-up text is fixed rather than configurable on purpose, because a free-form self-message would let the session put arbitrary words in the user's mouth. No step of this path needs root, and the injector drops privileges first if it was started under `sudo`.
+Compaction ends the model's turn and nothing else will start the next one, so on this path the injector finishes with a single fixed follow-up message, `[slashback] Context compacted. Continue where you left off.`, once the thread has gone idle again. If compaction failed, the follow-up carries the failure reason instead, so the session still resumes and knows what happened. `--no-resume` turns the follow-up off. The follow-up text is fixed rather than configurable on purpose, because a free-form self-message would let the session put arbitrary words in the user's mouth. No step of this path needs root, and the injector drops privileges first if it was started under `sudo`.
 
 This path was verified end to end on 2026-09-27 against a T3 server at 0.0.43-nightly.20260926.2282 running Claude Code 2.1.283. A session armed the injector against itself and ended its turn. About ten seconds later the injector dispatched `/compact`, and T3 recorded a `context-compaction` activity carrying the injector's message id that took the context from 155K to 5.02K tokens. The fixed follow-up then started the next turn, which picked the work back up from the summary, and `t3 auth session list` showed that the injector's bearer session had been revoked.
 
@@ -107,4 +109,4 @@ The other constraints carry over unchanged: the session is reached over SSH, pas
 
 ## Installing it as a skill
 
-The same mechanism ships as a Claude Code skill so a session can invoke it on demand. `SKILL.md` and `inject_compact.py` in this repo are the skill; place or symlink the directory at `~/.claude/skills/self-compact/` and the session can run the arming step above against itself. `python3 test_inject_compact.py` (or `pytest`) runs the unit tests, which cover the transcript gate, the path resolution, the guards, the write loop, and the T3 idle gate, outcome matching, and API client without needing sudo, T3, or a live session.
+The same mechanism ships as a Claude Code skill so a session can invoke it on demand. `SKILL.md` and `slashback.py` in this repo are the skill; place or symlink the directory at `~/.claude/skills/slashback/` and the session can run the arming step above against itself. `python3 test_slashback.py` (or `pytest`) runs the unit tests, which cover the transcript gate, the path resolution, the guards, the write loop, and the T3 idle gate, outcome matching, and API client without needing sudo, T3, or a live session.

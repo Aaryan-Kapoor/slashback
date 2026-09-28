@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-compact injector for a live Claude Code session.
+"""slashback: a live Claude Code session running slash commands on itself.
 
 Types an allowlisted slash command (default /compact) at the session's own idle prompt by
 duplicating the ssh pty master fd out of sshd with pidfd_getfd and writing the
@@ -9,7 +9,7 @@ user as soon as the master fd is held; everything after that (transcript
 parsing, locking, logging) runs unprivileged.
 
 Usage (from the arming wrapper in SKILL.md):
-  sudo -n python3 inject_compact.py --pid <claude_pid> --session <session_id>
+  sudo -n python3 slashback.py --pid <claude_pid> --session <session_id>
         [--command /compact] [--log FILE] [--transcript PATH] [--timeout 90] [--dry-run]
 
 Exit status: 0 delivered, 2 gave up (no idle window, or a pre-write check failed),
@@ -430,8 +430,8 @@ T3_IDLE_STATUS = {"ready", "idle"}
 T3_POLL = 1.0
 T3_COMPACTION_TIMEOUT = 660.0       # T3 itself gives up on the provider after 10 minutes
 T3_SETTLE_TIMEOUT = 300.0           # for the session to go idle again afterwards
-T3_RESUME_OK = "[self-compact] Context compacted. Continue where you left off."
-T3_RESUME_FAILED = "[self-compact] Compaction did not complete ({}). Continue where you left off."
+T3_RESUME_OK = "[slashback] Context compacted. Continue where you left off."
+T3_RESUME_FAILED = "[slashback] Compaction did not complete ({}). Continue where you left off."
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
@@ -658,7 +658,7 @@ def run_t3(a, log, server):
         f"command={a.command!r} resume={a.resume} uid={os.getuid()}")
 
     ttl = a.timeout + T3_COMPACTION_TIMEOUT + T3_SETTLE_TIMEOUT + 120
-    auth_session, token = t3_issue_token(server, ttl, f"self-compact {a.session[:8]}")
+    auth_session, token = t3_issue_token(server, ttl, f"slashback {a.session[:8]}")
     try:
         return t3_deliver(a, log, T3Api(server.origin, token), thread_id)
     finally:
@@ -732,7 +732,7 @@ def validate_command(command):
 
 def acquire_lock(transcript, session_id):
     """One injector per session. Returns the held fd, or None if another holds it."""
-    path = os.path.join(os.path.dirname(transcript), f".self-compact-{session_id}.lock")
+    path = os.path.join(os.path.dirname(transcript), f".slashback-{session_id}.lock")
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

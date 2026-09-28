@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Unit tests for inject_compact.py.
+"""Unit tests for slashback.py.
 
-Run: python3 test_inject_compact.py   (exits non-zero on failure)
- or: pytest test_inject_compact.py
+Run: python3 test_slashback.py   (exits non-zero on failure)
+ or: pytest test_slashback.py
 Synthetic transcripts and fds only; no live session or sudo needed.
 """
 import importlib.util
@@ -12,7 +12,7 @@ import sys
 import tempfile
 
 _spec = importlib.util.spec_from_file_location(
-    "ic", os.path.join(os.path.dirname(os.path.abspath(__file__)), "inject_compact.py")
+    "ic", os.path.join(os.path.dirname(os.path.abspath(__file__)), "slashback.py")
 )
 ic = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ic)
@@ -231,7 +231,7 @@ def test_lock_is_exclusive():
         os.close(again)
     finally:
         os.unlink(path)
-        lock = os.path.join(os.path.dirname(path), ".self-compact-sess.lock")
+        lock = os.path.join(os.path.dirname(path), ".slashback-sess.lock")
         if os.path.exists(lock):
             os.unlink(lock)
 
