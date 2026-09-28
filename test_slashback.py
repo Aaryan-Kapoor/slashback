@@ -130,6 +130,14 @@ def test_large_bookkeeping_record_hides_nothing():
     assert _turn_complete([A_END, snap]) is True
 
 
+def test_large_bookkeeping_record_between_turn_and_tail():
+    # The first window starts inside the snapshot and sees only cost-state; the tail
+    # must keep growing until it reaches the record that decides.
+    snap = {"type": "file-history-snapshot", "blob": "y" * 70000}
+    assert _turn_complete([A_END, snap, {"type": "cost-state"}]) is True
+    assert _turn_complete([U_PROMPT, snap, {"type": "cost-state"}]) is False
+
+
 def test_huge_tail_gives_up():
     old_max = ic.TAIL_MAX
     ic.TAIL_MAX = 4096

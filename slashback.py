@@ -325,11 +325,12 @@ def find_transcript(pid, session_id):
     return os.path.join(project_dir(cwd, process_environ(pid), home), f"{session_id}.jsonl")
 
 
-def tail_records(path):
+def tail_records(path, enough=bool):
     """Newest-first complete JSON records from the file tail, or None if unusable.
 
-    Grows the window until at least one complete line is available or the whole file
-    is read. A trailing fragment (an append in progress) makes the tail unusable.
+    Grows the window until enough(records) holds or the whole file is read, so a
+    large record cannot hide an older one the caller needs. A trailing fragment (an
+    append in progress) or a corrupt record makes the tail unusable.
     """
     try:
         with open(path, "rb") as f:
@@ -345,21 +346,26 @@ def tail_records(path):
                 lines = chunk.split(b"\n")
                 if start > 0:
                     lines = lines[1:]  # first piece is the truncated head of a record
-                lines = [l for l in lines if l.strip()]
-                if lines or start == 0:
-                    break
+                records = []
+                for raw in reversed(lines):
+                    if not raw.strip():
+                        continue
+                    try:
+                        records.append(json.loads(raw))
+                    except ValueError:
+                        return None  # corrupt record anywhere in the tail: refuse to guess
+                if start == 0 or enough(records):
+                    return records
                 if window >= TAIL_MAX:
                     return None
                 window *= 2
     except OSError:
         return None
-    out = []
-    for raw in reversed(lines):
-        try:
-            out.append(json.loads(raw))
-        except ValueError:
-            return None  # corrupt record anywhere in the tail: refuse to guess
-    return out
+
+
+def decides_turn_state(record):
+    """True for a record that says whether a turn is running, as opposed to bookkeeping."""
+    return not isinstance(record, dict) or record.get("type") not in METADATA_TYPES
 
 
 def turn_complete(path):
@@ -369,7 +375,7 @@ def turn_complete(path):
     turn ends with an assistant message whose stop_reason is terminal, followed only by
     known bookkeeping entries. Anything unrecognised fails closed.
     """
-    records = tail_records(path)
+    records = tail_records(path, enough=lambda recs: any(map(decides_turn_state, recs)))
     if not records:
         return False
     for o in records:
