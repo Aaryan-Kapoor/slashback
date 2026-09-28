@@ -287,6 +287,51 @@ def test_write_all_times_out_when_stalled():
         os.close(w)
 
 
+def test_deliver_logs_a_failed_write():
+    # A pty that closes mid-delivery must leave an outcome in the log, not a traceback.
+    r, w = os.pipe()
+    os.close(r)
+    lines = []
+    try:
+        rc = ic.deliver(w, "/compact", lambda: None, lines.append)
+    finally:
+        os.close(w)
+    assert rc == 2
+    assert len(lines) == 1 and lines[0].startswith("aborted during clear line:"), lines
+
+
+def test_deliver_rechecks_readiness_before_each_write():
+    r, w = os.pipe()
+    checks, lines = iter([None, "turn not complete"]), []
+    try:
+        rc = ic.deliver(w, "/compact", lambda: next(checks), lines.append)
+        written = os.read(r, 64)
+    finally:
+        os.close(r)
+        os.close(w)
+    assert rc == 2 and written == b"\x15"
+    assert lines == ["aborted before command: turn not complete"]
+
+
+def test_unexpected_error_is_logged():
+    fd, log = tempfile.mkstemp(suffix=".log")
+    os.close(fd)
+    real_run = ic.run
+
+    def boom(a, log):
+        raise RuntimeError("boom")
+
+    ic.run = boom
+    try:
+        rc = ic.main(["--pid", "12", "--session", "abc", "--log", log])
+        with open(log) as f:
+            text = f.read()
+    finally:
+        ic.run = real_run
+        os.unlink(log)
+    assert rc == 1 and "crashed: RuntimeError: boom" in text
+
+
 def test_pidfd_alive_and_exit():
     pid = os.fork()
     if pid == 0:

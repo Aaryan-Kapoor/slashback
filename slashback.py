@@ -736,6 +736,33 @@ def validate_command(command):
     return command
 
 
+def deliver(master, command, ready, log, dry_run=False):
+    """Type Ctrl-U, the command and Enter. Returns 0 once Enter is written, else 2.
+
+    Readiness is re-validated before each write, so a prompt that stops being idle
+    mid-sequence gets at most a cleared line, never a submitted command. A write that
+    stalls or hits a closed pty is logged with the step it failed on.
+    """
+    for label, data, pause in (("clear line", b"\x15", 0.15),
+                               ("command", command.encode(), 0.4),
+                               ("enter", b"\r", 0)):
+        why = ready()
+        if why is not None:
+            log(f"aborted before {label}: {why}")
+            return 2
+        if dry_run:
+            log(f"dry-run: would write {data!r} ({label})")
+        else:
+            try:
+                write_all(master, data)
+            except OSError as e:  # includes the TimeoutError from a stalled write
+                log(f"aborted during {label}: {e}")
+                return 2
+        time.sleep(pause)
+    log(f"delivered {command!r}" + (" (dry-run, nothing written)" if dry_run else ""))
+    return 0
+
+
 def acquire_lock(transcript, session_id):
     """One injector per session. Returns the held fd, or None if another holds it."""
     path = os.path.join(os.path.dirname(transcript), f".slashback-{session_id}.lock")
@@ -783,6 +810,10 @@ def main(argv=None):
         # leaves no trace. Record it, unprivileged so the log stays user-owned.
         drop_privileges()
         log(f"setup error: {e.code}")
+        return 1
+    except Exception as e:  # noqa: BLE001 - an unlogged crash is indistinguishable from a hang
+        drop_privileges()
+        log(f"crashed: {type(e).__name__}: {e}")
         return 1
 
 
@@ -847,22 +878,9 @@ def run(a, log):
                 return 2
             time.sleep(0.5)
 
-        # Deliver, re-validating before each write so a prompt that stops being idle
-        # mid-sequence gets at most a cleared line, never a submitted command.
         size_before = os.path.getsize(transcript)
-        for label, data, pause in (("clear line", b"\x15", 0.15),
-                                   ("command", command.encode(), 0.4),
-                                   ("enter", b"\r", 0)):
-            why = ready()
-            if why is not None:
-                log(f"aborted before {label}: {why}")
-                return 2
-            if a.dry_run:
-                log(f"dry-run: would write {data!r} ({label})")
-            else:
-                write_all(master, data)
-            time.sleep(pause)
-        log(f"delivered {command!r}" + (" (dry-run, nothing written)" if a.dry_run else ""))
+        if deliver(master, command, ready, log, a.dry_run) != 0:
+            return 2
 
         if command.split()[0] == "/compact" and not a.dry_run:
             until = time.monotonic() + 60
